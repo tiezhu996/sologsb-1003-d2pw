@@ -6,7 +6,7 @@ import {
   AlertCircle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
   CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, History, Import,
   Languages, Link2, Loader2, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
-  Send, ShieldCheck, Sparkles, Undo2, UndoDot, Variable, X,
+  Send, ShieldCheck, Sparkles, Trash2, Undo2, UndoDot, Variable, X,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -15,12 +15,19 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
-import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
-import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
+import { analyzeDocument, extractProtected, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import {
+  computeStableKey, restoreRemoved, summarizeMerge, toUpstreamBlocks,
+  type MergeCheckpoint, type MergeState, type MergeSummary, type ParsedUpstreamBlock,
+} from '@/lib/merge'
+import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments, seedUpstreamMarkdown } from '@/lib/seed'
+import type { Discussion, GlossaryTerm, HistoryEntry, RemovedSegment, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
-const DRAFT_KEY = 'sologsb-1003-localization-draft-v1'
+const DRAFT_KEY = 'sologsb-1003-localization-draft-v2'
+const LEGACY_DRAFT_KEY = 'sologsb-1003-localization-draft-v1'
+const CHECKPOINT_KEY = 'sologsb-1003-merge-checkpoint-v1'
+const FAIL_SIM_KEY = 'sologsb-1003-merge-fail-sim'
 const kindIcon = { heading: <FileText className="h-3.5 w-3.5" />, paragraph: <FileText className="h-3.5 w-3.5" />, code: <Code2 className="h-3.5 w-3.5" />, link: <Link2 className="h-3.5 w-3.5" />, variable: <Variable className="h-3.5 w-3.5" /> }
 const kindLabel: Record<Segment['kind'], string> = { heading: '标题', paragraph: '段落', code: '代码块', link: '链接', variable: '占位符' }
 const statusLabel: Record<SegmentStatus, string> = { draft: '草稿', 'needs-work': '待处理', confirmed: '已确认', returned: '已退回' }
@@ -36,6 +43,7 @@ const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 interface EditorSnapshot {
   segments: Segment[]
   discussions: Discussion[]
+  removedSegments: RemovedSegment[]
 }
 
 export function LocalizationWorkbench() {
@@ -45,6 +53,10 @@ export function LocalizationWorkbench() {
   const [discussions, setDiscussions] = useState<Discussion[]>(seedDiscussions)
   const [history, setHistory] = useState<HistoryEntry[]>(seedHistory)
   const [conflicts, setConflicts] = useState<TranslationConflict[]>(seedConflicts)
+  const [removedSegments, setRemovedSegments] = useState<RemovedSegment[]>([])
+  const [checkpoint, setCheckpoint] = useState<MergeCheckpoint | null>(null)
+  const [mergeStatus, setMergeStatus] = useState<{ kind: 'idle' | 'committing' | 'failed' | 'done'; message: string; summary?: MergeSummary }>({ kind: 'idle', message: '' })
+  const [simulateFailure, setSimulateFailure] = useState(false)
   const [checkedIssues, setCheckedIssues] = useState<TranslationIssue[] | null>(null)
   const [selectedSegmentId, setSelectedSegmentId] = useState('seg-05')
   const [mode, setMode] = useState<'translate' | 'review'>('translate')
@@ -99,13 +111,13 @@ export function LocalizationWorkbench() {
   })
   const saveMutation = useMutation({
     mutationFn: async () => {
-      const response = await fetch('/api/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ documentId: seedDocument.id, segments, discussions }) })
+      const response = await fetch('/api/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ documentId: seedDocument.id, segments, discussions, removedSegments }) })
       if (!response.ok) throw new Error('save failed')
       return response.json()
     },
     onSuccess: () => {
       setDirty(false)
-      try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
+      try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, removedSegments })) } catch { /* storage may be unavailable */ }
     },
   })
   const reviewMutation = useMutation({
@@ -113,6 +125,20 @@ export function LocalizationWorkbench() {
       const response = await fetch('/api/review', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       if (!response.ok) throw new Error('review failed')
       return response.json()
+    },
+  })
+  const mergeMutation = useMutation({
+    mutationFn: async (pending: MergeCheckpoint) => {
+      const response = await fetch('/api/merge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkpoint: pending, before: pending.before }),
+      })
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ message: '合并提交失败' }))
+        throw new Error(error.message ?? '合并提交失败')
+      }
+      return response.json() as Promise<MergeState & { summary: MergeSummary; committedAt: number }>
     },
   })
 
@@ -140,24 +166,40 @@ export function LocalizationWorkbench() {
   useEffect(() => {
     if (hydrated) return
     try {
-      const raw = localStorage.getItem(DRAFT_KEY)
+      const raw = localStorage.getItem(DRAFT_KEY) ?? localStorage.getItem(LEGACY_DRAFT_KEY)
       if (raw) {
-        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[] }
+        const draft = JSON.parse(raw) as {
+          segments?: Segment[]; discussions?: Discussion[]; glossary?: GlossaryTerm[]
+          history?: HistoryEntry[]; removedSegments?: RemovedSegment[]
+        }
         if (draft.segments?.length) {
           setSegments(draft.segments)
           setDiscussions(draft.discussions ?? seedDiscussions)
           setGlossary(draft.glossary ?? seedGlossary)
           setHistory(draft.history ?? seedHistory)
+          setRemovedSegments(draft.removedSegments ?? [])
         }
       }
+      const savedCheckpoint = localStorage.getItem(CHECKPOINT_KEY)
+      if (savedCheckpoint) {
+        const pending = JSON.parse(savedCheckpoint) as MergeCheckpoint
+        setCheckpoint(pending)
+        setSimulateFailure(pending.simulateFailure)
+        setMergeStatus({ kind: 'failed', message: `检测到上次“${pending.sourceFileName}”合并中断，检查点已保留，可重试或放弃。` })
+      }
+      setSimulateFailure(localStorage.getItem(FAIL_SIM_KEY) === '1')
     } catch { /* start from seed */ }
     setHydrated(true)
   }, [hydrated])
 
   useEffect(() => {
     if (!hydrated) return
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
-  }, [discussions, glossary, history, hydrated, segments])
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, removedSegments })) } catch { /* storage may be unavailable */ }
+  }, [discussions, glossary, history, hydrated, removedSegments, segments])
+
+  useEffect(() => {
+    try { localStorage.setItem(FAIL_SIM_KEY, simulateFailure ? '1' : '0') } catch { /* storage may be unavailable */ }
+  }, [simulateFailure])
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -169,15 +211,16 @@ export function LocalizationWorkbench() {
     return () => window.removeEventListener('beforeunload', beforeUnload)
   }, [dirty])
 
-  const snapshot = (): EditorSnapshot => ({ segments: clone(segments), discussions: clone(discussions) })
+  const snapshot = (): EditorSnapshot => ({ segments: clone(segments), discussions: clone(discussions), removedSegments: clone(removedSegments) })
   const pushHistoryEntry = (segmentId: string, action: HistoryEntry['action'], before: string, after: string, author = '当前用户') => {
     setHistory((current) => [{ id: `history-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, segmentId, author, action, before, after, createdAt: Date.now() }, ...current])
   }
-  const replaceState = (next: EditorSnapshot, markDirty = true) => {
+  const replaceState = (next: Partial<EditorSnapshot> & Pick<EditorSnapshot, 'segments' | 'discussions'>, markDirty = true) => {
     setPast((current) => [...current.slice(-49), snapshot()])
     setFuture([])
     setSegments(next.segments)
     setDiscussions(next.discussions)
+    if (next.removedSegments) setRemovedSegments(next.removedSegments)
     setCheckedIssues(null)
     if (markDirty) setDirty(true)
   }
@@ -200,6 +243,7 @@ export function LocalizationWorkbench() {
     setPast((current) => current.slice(0, -1))
     setSegments(previous.segments)
     setDiscussions(previous.discussions)
+    setRemovedSegments(previous.removedSegments)
     setCheckedIssues(null)
     setDirty(true)
   }
@@ -210,6 +254,7 @@ export function LocalizationWorkbench() {
     setFuture((current) => current.slice(1))
     setSegments(next.segments)
     setDiscussions(next.discussions)
+    setRemovedSegments(next.removedSegments)
     setCheckedIssues(null)
     setDirty(true)
   }
@@ -240,22 +285,118 @@ export function LocalizationWorkbench() {
     void reviewMutation.mutateAsync({ action: 'bulk-return', segmentIds: ids, reason: returnReason })
     setSelectedForReturn(new Set())
   }
+  // 合并冲突（重新导入产生）：本地片段仍挂在旧原文上，处理前不覆盖；解决后接回新原文。
+  const resolveMergeConflict = (conflict: TranslationConflict, choice: 'keep-local' | 'retranslate') => {
+    const segment = segments.find((item) => item.id === conflict.segmentId)
+    if (!segment || !conflict.upstreamSource) return
+    const nextSource = conflict.upstreamSource
+    const nextTarget = choice === 'keep-local' ? conflict.localText : ''
+    const next = segments.map((item) => item.id === segment.id ? {
+      ...item,
+      sourceText: nextSource,
+      targetText: nextTarget,
+      status: 'draft' as SegmentStatus,
+      previousSourceText: conflict.previousSource ?? segment.sourceText,
+      stableKey: computeStableKey(nextSource, segment.kind),
+      baseSourceText: nextSource,
+      baseTargetText: nextTarget,
+      protectedTokens: extractProtected(nextSource),
+    } : item)
+    replaceState({ segments: next, discussions: clone(discussions), removedSegments: clone(removedSegments) })
+    pushHistoryEntry(segment.id, 'resolve-conflict', segment.targetText, nextTarget, choice === 'keep-local' ? '保留本地译文并接回新原文' : '采用上游原文重译')
+    setConflicts((current) => current.filter((item) => item.id !== conflict.id))
+  }
+  // 并发冲突（原有）：本地译文 vs 远端译文二选一。
   const resolveConflict = (conflict: TranslationConflict, strategy: 'local' | 'remote') => {
     const targetText = strategy === 'local' ? conflict.localText : conflict.remoteText
     const segment = segments.find((item) => item.id === conflict.segmentId)
     const next = segments.map((item) => item.id === conflict.segmentId ? { ...item, targetText, status: 'draft' as const } : item)
-    replaceState({ segments: next, discussions: clone(discussions) })
+    replaceState({ segments: next, discussions: clone(discussions), removedSegments: clone(removedSegments) })
     if (segment) pushHistoryEntry(segment.id, 'resolve-conflict', segment.targetText, targetText, strategy === 'local' ? '保留本地' : conflict.remoteAuthor)
     setConflicts((current) => current.filter((item) => item.id !== conflict.id))
   }
+
+  const persistCheckpoint = (next: MergeCheckpoint | null) => {
+    try {
+      if (next) localStorage.setItem(CHECKPOINT_KEY, JSON.stringify(next))
+      else localStorage.removeItem(CHECKPOINT_KEY)
+    } catch { /* storage may be unavailable */ }
+  }
+
+  // 从检查点提交（或重试）。永远以 checkpoint.before 为输入，失败只更新尝试次数，不落地半成品。
+  const commitCheckpoint = async (pending: MergeCheckpoint) => {
+    setMergeStatus({ kind: 'committing', message: `正在与上游“${pending.sourceFileName}”合并…（第 ${pending.attempt} 次尝试）` })
+    try {
+      const result = await mergeMutation.mutateAsync(pending)
+      // 提交成功：一次性原子落地合并结果。
+      setPast((current) => [...current.slice(-49), snapshot()])
+      setFuture([])
+      setSegments(result.segments)
+      setDiscussions(result.discussions)
+      setRemovedSegments(result.removedSegments)
+      setConflicts(result.conflicts)
+      setHistory(result.history)
+      setCheckedIssues(null)
+      setDirty(true)
+      setCheckpoint(null)
+      persistCheckpoint(null)
+      if (pending.simulateFailure) setSimulateFailure(false)
+      const firstId = result.segments[0]?.id
+      if (firstId) setSelectedSegmentId(firstId)
+      setMergeStatus({ kind: 'done', message: summarizeMerge(result.summary, pending.sourceFileName), summary: result.summary })
+    } catch (error) {
+      // 中途失败：保留检查点（状态仍是合并前的 before），重试不会叠加历史或片段。
+      const retried: MergeCheckpoint = { ...pending, attempt: pending.attempt + 1 }
+      setCheckpoint(retried)
+      persistCheckpoint(retried)
+      setMergeStatus({ kind: 'failed', message: `${error instanceof Error ? error.message : '合并失败'} 已保留检查点，可重试。` })
+    }
+  }
+
+  // 重新导入上游文档：解析 -> 建立检查点 -> 提交。绝不直接清空译文。
+  const startMerge = (markdown: string, sourceFileName: string) => {
+    const imported = parseMarkdown(markdown)
+    if (!imported.length) {
+      setMergeStatus({ kind: 'failed', message: '未从导入内容识别到任何片段，已取消合并，本地草稿保持不变。' })
+      return
+    }
+    const upstream: ParsedUpstreamBlock[] = toUpstreamBlocks(imported)
+    const before: MergeState = { segments, discussions, removedSegments, conflicts, history }
+    const pending: MergeCheckpoint = {
+      runId: `run-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      sourceFileName,
+      upstreamChecksum: upstream.map((block) => block.stableKey).join('|'),
+      startedAt: Date.now(),
+      attempt: 1,
+      simulateFailure,
+      upstream,
+      before,
+    }
+    setCheckpoint(pending)
+    persistCheckpoint(pending)
+    void commitCheckpoint(pending)
+  }
+
+  const retryMerge = () => { if (checkpoint) void commitCheckpoint(checkpoint) }
+  const abandonCheckpoint = () => {
+    setCheckpoint(null)
+    persistCheckpoint(null)
+    setMergeStatus({ kind: 'idle', message: '' })
+  }
+
+  const restoreRemovedRecord = (record: RemovedSegment) => {
+    const before: MergeState = { segments, discussions, removedSegments, conflicts, history }
+    const result = restoreRemoved(before, record, Date.now())
+    replaceState({ segments: result.segments, discussions: result.discussions, removedSegments: result.removedSegments })
+    setHistory(result.history)
+    setSelectedSegmentId(result.restored.id)
+  }
+
   const importMarkdown = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     if (!file) return
-    const imported = parseMarkdown(await file.text())
-    if (!imported.length) return
-    replaceState({ segments: imported, discussions: [] })
-    pushHistoryEntry(imported[0].id, 'import', '', file.name)
-    setSelectedSegmentId(imported[0].id)
+    // 上游文档可能已更新：与断网草稿做三方合并，而不是覆盖整份译文。
+    startMerge(await file.text(), file.name)
     event.target.value = ''
   }
   const exportMarkdown = () => {
@@ -309,11 +450,53 @@ export function LocalizationWorkbench() {
             <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={undo} disabled={!past.length}><Undo2 className="h-4 w-4" />撤销</Button>
             <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={redo} disabled={!future.length}><RotateCw className="h-4 w-4" />重做</Button>
             <input ref={fileInput} type="file" accept=".md,.markdown,text/markdown" className="hidden" onChange={(event) => void importMarkdown(event)} />
-            <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={() => fileInput.current?.click()}><Import className="h-4 w-4" />导入</Button>
+            <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={() => startMerge(seedUpstreamMarkdown, 'docs/deployment.md（上游更新）')} title="模拟断网后拉取到更新的上游文档"><RefreshCw className="h-4 w-4" />上游更新</Button>
+            <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={() => fileInput.current?.click()}><Import className="h-4 w-4" />导入合并</Button>
             <Button size="sm" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending}><Save className="h-4 w-4" />保存</Button>
           </div>
         </div>
       </header>
+
+      {/* 合并检查点条：提交中 / 失败保留检查点 / 合并完成汇报 */}
+      {(mergeStatus.kind !== 'idle' || checkpoint) && (
+        <div className={cn(
+          'border-b px-4 py-2.5 text-xs lg:px-6',
+          mergeStatus.kind === 'failed' ? 'border-amber-300 bg-amber-50 text-amber-900'
+            : mergeStatus.kind === 'committing' ? 'border-blue-200 bg-blue-50 text-blue-900'
+              : 'border-emerald-200 bg-emerald-50 text-emerald-900',
+        )}>
+          <div className="mx-auto flex max-w-[1800px] flex-wrap items-center gap-3">
+            {mergeStatus.kind === 'committing' ? <Loader2 className="h-4 w-4 animate-spin" /> : mergeStatus.kind === 'failed' ? <CircleAlert className="h-4 w-4" /> : <Check className="h-4 w-4" />}
+            <span className="font-medium">{mergeStatus.message}</span>
+            {mergeStatus.summary && (
+              <span className="flex flex-wrap gap-1.5">
+                <Badge variant="secondary" className="bg-white/70">保留 {mergeStatus.summary.unchanged}</Badge>
+                <Badge variant="secondary" className="bg-white/70">接回 {mergeStatus.summary.reattached}</Badge>
+                <Badge variant="destructive">并列冲突 {mergeStatus.summary.conflict}</Badge>
+                <Badge variant="secondary" className="bg-white/70">新增 {mergeStatus.summary.added}</Badge>
+                <Badge variant="secondary" className="bg-white/70">移除 {mergeStatus.summary.removed}</Badge>
+              </span>
+            )}
+            <div className="ml-auto flex items-center gap-2">
+              {mergeStatus.kind === 'failed' && checkpoint && (
+                <>
+                  <Button size="sm" variant="default" onClick={retryMerge} disabled={mergeMutation.isPending}><RefreshCw className="mr-1 h-3.5 w-3.5" />从检查点重试</Button>
+                  <Button size="sm" variant="ghost" onClick={abandonCheckpoint}>放弃并保留草稿</Button>
+                </>
+              )}
+              {mergeStatus.kind === 'done' && <Button size="sm" variant="ghost" onClick={() => setMergeStatus({ kind: 'idle', message: '' })}>知道了</Button>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 故障演练开关：下次合并在提交前中断一次，用于验证检查点与重试幂等。 */}
+      <div className="border-b bg-slate-50 px-4 py-1.5 text-[11px] text-slate-500 lg:px-6">
+        <label className="mx-auto flex max-w-[1800px] cursor-pointer items-center gap-2">
+          <input type="checkbox" className="h-3.5 w-3.5 accent-amber-600" checked={simulateFailure} onChange={(event) => setSimulateFailure(event.target.checked)} />
+          故障演练：下一次“上游更新 / 导入合并”在提交前中断（第 1 次请求失败），检查点保留后重试
+        </label>
+      </div>
 
       <div className="border-b bg-white/85 px-4 py-2.5 backdrop-blur lg:px-6">
         <div className="mx-auto flex max-w-[1800px] flex-wrap items-center gap-x-6 gap-y-2 text-xs text-slate-600">
@@ -376,6 +559,7 @@ export function LocalizationWorkbench() {
                   <span className="text-[11px] font-semibold text-slate-500">#{String(segment.index).padStart(2, '0')}</span>
                   <Badge variant="outline" className="gap-1 text-[10px]">{kindIcon[segment.kind]}{kindLabel[segment.kind]}</Badge>
                   <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', statusClass[segment.status])}>{statusLabel[segment.status]}</span>
+                  {segment.previousSourceText && segment.status === 'needs-work' && <Badge variant="outline" className="gap-1 border-amber-300 text-amber-700"><RefreshCw className="h-3 w-3" />原文已更新 · 待处理</Badge>}
                   {segment.protectedTokens.length > 0 && <Badge variant="secondary" className="gap-1 text-[10px]"><Variable className="h-3 w-3" />{segment.protectedTokens.length} 个受保护标记</Badge>}
                   {!!segmentIssues.length && <Badge variant="destructive" className="ml-auto">{segmentIssues.length} 个问题</Badge>}
                   <div className={cn('flex gap-1.5', !segmentIssues.length && 'ml-auto')}>
@@ -386,6 +570,12 @@ export function LocalizationWorkbench() {
                   <div className="min-w-0 p-3.5">
                     <div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">English · Source</span><Badge variant="outline" className="text-[9px]">只读</Badge></div>
                     <div className={cn('document-prose text-sm leading-6 text-slate-700', segment.kind === 'code' && 'markdown-code rounded-lg bg-slate-950 p-3 text-xs text-slate-100')}>{segment.sourceText}</div>
+                    {segment.previousSourceText && segment.status === 'needs-work' && (
+                      <details className="mt-3 rounded-md border border-amber-200 bg-amber-50/60 px-2.5 py-1.5 text-[10px] text-amber-800">
+                        <summary className="cursor-pointer font-semibold">上游改动前的原文（译文已保留，请据新原文复核）</summary>
+                        <p className="mt-1.5 leading-5 text-amber-700 line-through decoration-amber-400/60">{segment.previousSourceText}</p>
+                      </details>
+                    )}
                     {segment.note && <p className="mt-3 rounded-md bg-amber-50 px-2.5 py-1.5 text-[10px] text-amber-700">译者备注：{segment.note}</p>}
                   </div>
                   <div className="min-w-0 p-3.5">
@@ -405,7 +595,7 @@ export function LocalizationWorkbench() {
         <aside className="workbench-right min-w-0">
           <Card className="sticky top-[74px] max-h-[calc(100vh-96px)] overflow-hidden">
             <Tabs defaultValue="discussion" className="flex h-full flex-col">
-              <TabsList className="mx-3 mt-3 grid grid-cols-4"><TabsTrigger id="discussion-tab" value="discussion" className="px-1 text-[11px]">讨论</TabsTrigger><TabsTrigger value="issues" className="px-1 text-[11px]">问题</TabsTrigger><TabsTrigger value="history" className="px-1 text-[11px]">历史</TabsTrigger><TabsTrigger value="conflicts" className="px-1 text-[11px]">冲突 {conflicts.length ? `(${conflicts.length})` : ''}</TabsTrigger></TabsList>
+              <TabsList className="mx-3 mt-3 grid grid-cols-5"><TabsTrigger id="discussion-tab" value="discussion" className="px-1 text-[11px]">讨论</TabsTrigger><TabsTrigger value="issues" className="px-1 text-[11px]">问题</TabsTrigger><TabsTrigger value="history" className="px-1 text-[11px]">历史</TabsTrigger><TabsTrigger value="conflicts" className="px-1 text-[11px]">冲突 {conflicts.length ? `(${conflicts.length})` : ''}</TabsTrigger><TabsTrigger value="removed" className="px-1 text-[11px]">已移除 {removedSegments.length ? `(${removedSegments.length})` : ''}</TabsTrigger></TabsList>
               <TabsContent value="discussion" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3">
                 <div className="rounded-lg border border-blue-100 bg-blue-50/60 p-2.5"><p className="text-[10px] font-semibold text-blue-800">当前片段 #{selectedSegment?.index}</p><p className="mt-1 line-clamp-3 text-xs leading-5 text-blue-700">{selectedSegment?.targetText || selectedSegment?.sourceText}</p></div>
                 <div className="mt-3 flex gap-2"><Textarea value={discussionDraft} onChange={(event) => setDiscussionDraft(event.target.value)} rows={2} placeholder="针对当前句子留下讨论…" className="text-xs" /><Button size="icon" className="h-auto self-stretch" onClick={addDiscussion}><Send className="h-4 w-4" /></Button></div>
@@ -413,7 +603,47 @@ export function LocalizationWorkbench() {
               </TabsContent>
               <TabsContent value="issues" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-2">{issues.map((issue) => <button key={issue.id} onClick={() => selectAndScroll(issue.segmentId)} className="w-full rounded-lg border p-3 text-left hover:border-amber-300 hover:bg-amber-50"><div className="flex items-center justify-between"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segments.find((item) => item.id === issue.segmentId)?.index}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{issue.message}</p></button>)}{!issues.length && <p className="py-8 text-center text-xs text-emerald-600">没有待处理问题</p>}</div></TabsContent>
               <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {entry.action}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
-              <TabsContent value="conflicts" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{conflicts.map((conflict) => <div key={conflict.id} className="overflow-hidden rounded-lg border border-red-200"><div className="bg-red-50 px-3 py-2"><b className="text-xs text-red-800">片段 #{segments.find((item) => item.id === conflict.segmentId)?.index} 存在并发修改</b><p className="mt-1 text-[10px] text-red-600">{conflict.remoteAuthor} 修改了同一句</p></div><div className="space-y-2 p-3"><div><span className="text-[9px] font-semibold text-slate-400">本地版本</span><p className="mt-1 text-[11px] leading-5 text-slate-600">{conflict.localText}</p></div><div><span className="text-[9px] font-semibold text-slate-400">远端版本</span><p className="mt-1 text-[11px] leading-5 text-blue-700">{conflict.remoteText}</p></div><div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => resolveConflict(conflict, 'local')}>保留本地</Button><Button size="sm" onClick={() => resolveConflict(conflict, 'remote')}>采用远端</Button></div></div></div>)}{!conflicts.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />所有冲突已解决</div>}</div></TabsContent>
+              <TabsContent value="conflicts" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{conflicts.map((conflict) => {
+                const segment = segments.find((item) => item.id === conflict.segmentId)
+                const isMerge = conflict.kind === 'merge'
+                return (
+                  <div key={conflict.id} className="overflow-hidden rounded-lg border border-red-200">
+                    <div className="bg-red-50 px-3 py-2">
+                      <b className="text-xs text-red-800">片段 #{segment?.index ?? '—'} {isMerge ? '原文与译文两边都改过' : '存在并发修改'}</b>
+                      <p className="mt-1 text-[10px] text-red-600">{isMerge ? '处理前本地与上游内容并列保留，均未覆盖。' : `${conflict.remoteAuthor} 修改了同一句`}</p>
+                    </div>
+                    <div className="space-y-2 p-3">
+                      {isMerge && <div><span className="text-[9px] font-semibold text-slate-400">上游新原文</span><p className="mt-1 rounded bg-blue-50/60 p-2 text-[11px] leading-5 text-blue-800">{conflict.upstreamSource}</p></div>}
+                      <div><span className="text-[9px] font-semibold text-slate-400">{isMerge ? '本地译文（对应旧原文）' : '本地版本'}</span><p className="mt-1 text-[11px] leading-5 text-slate-600">{conflict.localText}</p></div>
+                      {isMerge && <div><span className="text-[9px] font-semibold text-slate-400">改动前原文</span><p className="mt-1 text-[11px] leading-5 text-slate-400 line-through">{conflict.previousSource}</p></div>}
+                      {!isMerge && <div><span className="text-[9px] font-semibold text-slate-400">远端版本</span><p className="mt-1 text-[11px] leading-5 text-blue-700">{conflict.remoteText}</p></div>}
+                      {isMerge ? (
+                        <div className="flex flex-wrap gap-2">
+                          <Button size="sm" variant="outline" onClick={() => resolveMergeConflict(conflict, 'keep-local')}>保留本地译文并接回新原文</Button>
+                          <Button size="sm" variant="destructive" onClick={() => resolveMergeConflict(conflict, 'retranslate')}>清空译文重新翻译</Button>
+                        </div>
+                      ) : (
+                        <div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => resolveConflict(conflict, 'local')}>保留本地</Button><Button size="sm" onClick={() => resolveConflict(conflict, 'remote')}>采用远端</Button></div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}{!conflicts.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />所有冲突已解决</div>}</div></TabsContent>
+              <TabsContent value="removed" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{removedSegments.map((record) => (
+                <div key={record.id} className="overflow-hidden rounded-lg border border-slate-200 bg-slate-50/60">
+                  <div className="flex items-center gap-2 bg-slate-100 px-3 py-2">
+                    <Trash2 className="h-3.5 w-3.5 text-slate-500" />
+                    <Badge variant="outline" className="gap-1 text-[10px]">{kindIcon[record.kind]}{kindLabel[record.kind]}</Badge>
+                    <span className={cn('ml-auto rounded-full px-2 py-0.5 text-[10px] font-medium', statusClass[record.status])}>{statusLabel[record.status]}</span>
+                  </div>
+                  <div className="space-y-2 p-3">
+                    <div><span className="text-[9px] font-semibold text-slate-400">被移除的原文</span><p className="mt-1 line-clamp-3 text-[11px] leading-5 text-slate-500 line-through">{record.sourceText}</p></div>
+                    <div><span className="text-[9px] font-semibold text-slate-400">保留的译文</span><p className="mt-1 text-[11px] leading-5 text-slate-700">{record.targetText || <span className="text-slate-400">（空）</span>}</p></div>
+                    {record.discussions.length > 0 && <p className="text-[10px] text-slate-400">随附讨论 {record.discussions.length} 条（{record.discussions.filter((d) => !d.resolved).length} 条未解决）</p>}
+                    <Button size="sm" variant="outline" onClick={() => restoreRemovedRecord(record)}><RotateCcw className="mr-1 h-3.5 w-3.5" />恢复到工作区</Button>
+                  </div>
+                </div>
+              ))}{!removedSegments.length && <p className="py-8 text-center text-xs text-slate-400">没有被上游移除的片段</p>}</div></TabsContent>
             </Tabs>
           </Card>
           <div className="mt-3 rounded-xl border bg-slate-950 px-3 py-3 text-[10px] text-slate-400"><p className="mb-2 font-semibold text-slate-200">键盘操作</p><div className="grid grid-cols-2 gap-2"><span><kbd>J</kbd> 下一问题</span><span><kbd>K</kbd> 上一问题</span><span><kbd>C</kbd> 确认</span><span><kbd>R</kbd> 退回</span><span><kbd>⌘ Z</kbd> 撤销</span><span><kbd>⌘ ⇧ Z</kbd> 重做</span></div></div>

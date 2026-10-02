@@ -1,5 +1,6 @@
 import { http, HttpResponse } from 'msw'
 import { analyzeDocument } from '@/lib/markdown'
+import { mergeIntoState, type MergeCheckpoint, type MergeState } from '@/lib/merge'
 import { seedConflicts, seedDocument, seedHistory } from '@/lib/seed'
 import type { GlossaryTerm, Segment } from '@/lib/types'
 
@@ -16,12 +17,28 @@ export const handlers = [
   }),
   http.post('/api/draft', async ({ request }) => {
     const body = await request.json() as { documentId: string; segments: Segment[]; discussions: unknown[] }
-    await new Promise((resolve) => setTimeout(resolve, 240))
+    await new Promise((resolve) => setTimeout(resolve, 180))
     return HttpResponse.json({ saved: true, documentId: body.documentId, segmentCount: body.segments.length, savedAt: Date.now() })
   }),
   http.post('/api/review', async ({ request }) => {
     const body = await request.json() as { action: string; segmentIds: string[]; reason?: string }
     await new Promise((resolve) => setTimeout(resolve, 280))
     return HttpResponse.json({ accepted: true, ...body, reviewedAt: Date.now() })
+  }),
+  // 断网恢复后的合并接口：检查点先于提交落盘；演练开关会在提交前制造一次失败。
+  http.post('/api/merge', async ({ request }) => {
+    const body = await request.json() as { checkpoint: MergeCheckpoint; before: MergeState }
+    const { checkpoint, before } = body
+    await new Promise((resolve) => setTimeout(resolve, 420))
+    if (checkpoint.simulateFailure && checkpoint.attempt === 1) {
+      return HttpResponse.json({ error: 'simulated-network-reset', message: '合并提交中断：检查点已保留，可重试。' }, { status: 503 })
+    }
+    const mergedAt = Date.now()
+    const result = mergeIntoState(clone(before), clone(checkpoint.upstream), {
+      runId: checkpoint.runId,
+      sourceFileName: checkpoint.sourceFileName,
+      mergedAt,
+    })
+    return HttpResponse.json({ ...result, committedAt: mergedAt })
   }),
 ]

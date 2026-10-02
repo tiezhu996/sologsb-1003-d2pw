@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test:merge": "bash scripts/run-merge-test.sh"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.1.2",

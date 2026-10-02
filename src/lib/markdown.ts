@@ -1,3 +1,4 @@
+import { computeStableKey } from './merge'
 import type { GlossaryTerm, Segment, SegmentKind, TranslationIssue } from './types'
 
 const variablePattern = /\{\{[^{}]+\}\}|\{[A-Za-z_][\w.-]*\}|%\([^)]+\)[sd]|%[sd]/g
@@ -28,16 +29,23 @@ export const parseMarkdown = (markdown: string): Segment[] => {
     cursor = (match.index ?? 0) + match[0].length
   }
   blocks.push(...normalized.slice(cursor).split(/\n{2,}/).filter((part) => part.trim()).map((text) => ({ text: text.trim(), code: false })))
-  return blocks.map((block, index) => ({
-    id: `segment-import-${index + 1}`,
-    index: index + 1,
-    kind: segmentKind(block.text, block.code),
-    sourceText: block.text,
-    targetText: '',
-    status: 'draft' as const,
-    protectedTokens: extractProtected(block.text),
-    note: '',
-  }))
+  return blocks.map((block, index) => {
+    const kind = segmentKind(block.text, block.code)
+    return {
+      id: `segment-import-${index + 1}`,
+      index: index + 1,
+      kind,
+      sourceText: block.text,
+      targetText: '',
+      status: 'draft' as const,
+      protectedTokens: extractProtected(block.text),
+      note: '',
+      // 新导入即记录稳定标识与基线，后续再导入可做三方合并；旧稿没有这些字段。
+      stableKey: computeStableKey(block.text, kind),
+      baseSourceText: block.text,
+      baseTargetText: '',
+    }
+  })
 }
 
 const meaningful = (text: string) => text.replace(/[#*_`>\s]/g, '').length > 1

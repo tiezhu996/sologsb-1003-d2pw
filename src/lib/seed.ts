@@ -1,17 +1,48 @@
 import type { Discussion, GlossaryTerm, HistoryEntry, LocalizationDocument, Segment, TranslationConflict } from './types'
 
-export const seedSegments: Segment[] = [
+/**
+ * 为种子片段补齐稳定标识与三方合并基线。
+ * 基线代表“上次与上游同步”时的原文/译文：
+ * - 大多数片段本地译文 == 基线译文，原文更新时会走“接回 + 待处理”；
+ * - seg-05 本地译文偏离基线，且上游原文已更新，是“两边都改”的并列冲突样例。
+ */
+const withBaseline = (segment: Segment): Segment => ({
+  ...segment,
+  stableKey: segment.stableKey ?? undefined,
+  baseSourceText: segment.baseSourceText ?? segment.sourceText,
+  baseTargetText: segment.baseTargetText ?? segment.targetText,
+})
+
+const rawSegments: Segment[] = [
   { id: 'seg-01', index: 1, kind: 'heading', sourceText: '# Deployment Guide', targetText: '# 部署指南', status: 'confirmed', protectedTokens: [], note: '保留 Markdown 标题层级。' },
   { id: 'seg-02', index: 2, kind: 'paragraph', sourceText: 'This guide explains how to deploy {{project_name}} version {{version}} to a Kubernetes cluster.', targetText: '本指南介绍如何将 {{project_name}} {{version}} 版部署到 Kubernetes 集群。', status: 'draft', protectedTokens: ['{{project_name}}', '{{version}}'], note: '项目名和版本号保留占位符。' },
   { id: 'seg-03', index: 3, kind: 'heading', sourceText: '## Prerequisites', targetText: '## 前置条件', status: 'confirmed', protectedTokens: [], note: '' },
   { id: 'seg-04', index: 4, kind: 'link', sourceText: 'Before you begin, review the [configuration reference](https://docs.example.com/config) and install `kubectl`.', targetText: '开始前，请阅读 [配置参考](https://docs.example.com/config)，并安装 `kubectl`。', status: 'draft', protectedTokens: ['https://docs.example.com/config'], note: '' },
-  { id: 'seg-05', index: 5, kind: 'paragraph', sourceText: 'The operator requires cluster-admin privileges during installation. Production environments should use a dedicated service account.', targetText: '安装 operator 时需要集群管理员权限。生产环境建议使用专用的服务账号。', status: 'needs-work', protectedTokens: [], note: 'operator 的术语待 unified。' },
+  {
+    id: 'seg-05', index: 5, kind: 'paragraph',
+    // 本地与基线一致；示例上游会改写这段原文，而本地译文未偏离基线 -> 接回 + 待处理。
+    sourceText: 'The operator requires cluster-admin privileges during installation. Production environments should use a dedicated service account.',
+    targetText: '安装 operator 时需要集群管理员权限。生产环境建议使用专用的服务账号。',
+    baseSourceText: 'The operator requires cluster-admin privileges during installation. Production environments should use a dedicated service account.',
+    baseTargetText: '安装 operator 时需要集群管理员权限。生产环境建议使用专用的服务账号。',
+    status: 'needs-work', protectedTokens: [], note: 'operator 的术语待统一。',
+  },
   { id: 'seg-06', index: 6, kind: 'code', sourceText: '```bash\nhelm upgrade --install {{release_name}} oci://registry.example.com/operator --version {{version}}\n```', targetText: '```bash\nhelm upgrade --install {{release_name}} oci://registry.example.com/operator --version {{version}}\n```', status: 'confirmed', protectedTokens: ['{{release_name}}', '{{version}}'], note: '命令保持原样。' },
   { id: 'seg-07', index: 7, kind: 'variable', sourceText: 'Set `replicaCount` to `{replica_count}` in your values file.', targetText: '在 values 文件中将 `replicaCount` 设置为 `{replica_count}`。', status: 'draft', protectedTokens: ['{replica_count}'], note: '' },
-  { id: 'seg-08', index: 8, kind: 'paragraph', sourceText: 'If the controller cannot reach the API server, check the network policy and then restart the pod.', targetText: '如果控制器无法连接 API 服务器，请检查网络策略，然后重启 Pod。', status: 'draft', protectedTokens: [], note: '' },
+  {
+    id: 'seg-08', index: 8, kind: 'paragraph',
+    // 断网期间本地译文已偏离基线（target != baseTarget）；示例上游同时改写原文 -> 两边都改 -> 并列冲突。
+    sourceText: 'If the controller cannot reach the API server, check the network policy and then restart the pod.',
+    targetText: '如果控制器无法连接 API 服务器，请先检查网络策略与防火墙规则，然后重启 Pod。',
+    baseSourceText: 'If the controller cannot reach the API server, check the network policy and then restart the pod.',
+    baseTargetText: '如果控制器无法连接 API 服务器，请检查网络策略，然后重启 Pod。',
+    status: 'draft', protectedTokens: [], note: '',
+  },
   { id: 'seg-09', index: 9, kind: 'link', sourceText: 'See [Troubleshooting](https://docs.example.com/troubleshooting#connectivity) for detailed diagnostics.', targetText: '详细诊断请参阅 [故障排查](https://docs.example.com/troubleshooting)。', status: 'returned', protectedTokens: ['https://docs.example.com/troubleshooting#connectivity'], note: '锚点链接丢失，需要修复。' },
   { id: 'seg-10', index: 10, kind: 'heading', sourceText: '## Upgrade Notes', targetText: '', status: 'draft', protectedTokens: [], note: '漏译示例。' },
 ]
+
+export const seedSegments: Segment[] = rawSegments.map(withBaseline)
 
 export const seedGlossary: GlossaryTerm[] = [
   { id: 'term-01', source: 'operator', target: 'Operator', caseSensitive: false, note: 'Kubernetes 扩展概念，保留首字母大写。' },
@@ -48,3 +79,38 @@ export const seedDocument: LocalizationDocument = {
   glossary: seedGlossary,
   discussions: seedDiscussions,
 }
+
+/**
+ * “上游文档已更新”的示例：用于一键演示断网草稿与上游版本的三方合并。
+ * - seg-01/02/03/04/06/07/09/10 原文未动（其中 07 位置前移，验证重排）；
+ * - seg-05 原文更新、本地译文未偏离基线 -> 接回 + 待处理；
+ * - seg-08 原文更新且本地译文断网改过 -> 并列冲突；
+ * - 新增两段（含一句与正文重复的句子，验证重复句顺序区分）-> 留空待译；
+ * - seg-10 被上游删除 -> 带译文进入已移除清单（seg-10 本就无译文，仍带状态）。
+ */
+export const seedUpstreamMarkdown = `# Deployment Guide
+
+This guide explains how to deploy {{project_name}} version {{version}} to a Kubernetes cluster.
+
+## Prerequisites
+
+Before you begin, review the [configuration reference](https://docs.example.com/config) and install \`kubectl\`.
+
+The operator requires cluster-admin privileges during installation. Production environments should run in a dedicated namespace with least-privilege roles.
+
+\`\`\`bash
+helm upgrade --install {{release_name}} oci://registry.example.com/operator --version {{version}}
+\`\`\`
+
+Set \`replicaCount\` to \`{replica_count}\` in your values file.
+
+If the controller cannot reach the API server, inspect the ingress rules and restart the pod after fixing the network policy.
+
+See [Troubleshooting](https://docs.example.com/troubleshooting#connectivity) for detailed diagnostics.
+
+## Rollback Strategy
+
+You can roll back the last release with \`helm rollback {{release_name}}\`.
+
+Set \`replicaCount\` to \`{replica_count}\` in your values file.`
+

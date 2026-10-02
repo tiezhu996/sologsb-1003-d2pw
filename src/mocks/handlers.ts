@@ -1,12 +1,13 @@
 import { http, HttpResponse } from 'msw'
 import { analyzeDocument } from '@/lib/markdown'
-import { seedConflicts, seedDocument, seedHistory } from '@/lib/seed'
+import { seedConflicts, seedDocument, seedHistory, seedUpstreamV2 } from '@/lib/seed'
 import type { GlossaryTerm, Segment } from '@/lib/types'
 
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 export const handlers = [
   http.get('/api/document', () => HttpResponse.json(clone(seedDocument))),
+  http.get('/api/document/upstream', () => HttpResponse.json(clone(seedUpstreamV2))),
   http.get('/api/history', () => HttpResponse.json(clone(seedHistory))),
   http.get('/api/conflicts', () => HttpResponse.json(clone(seedConflicts))),
   http.post('/api/check', async ({ request }) => {

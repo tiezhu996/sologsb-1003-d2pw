@@ -16,7 +16,8 @@ export const segmentKind = (text: string, fencedCode: boolean): SegmentKind => {
   return 'paragraph'
 }
 
-export const parseMarkdown = (markdown: string): Segment[] => {
+export const parseMarkdown = (markdown: string, options: { markBaseline?: boolean; idPrefix?: string } = {}): Segment[] => {
+  const prefix = options.idPrefix ?? 'segment-import'
   const normalized = markdown.replace(/\r/g, '')
   const blocks: { text: string; code: boolean }[] = []
   const codeFence = /```[\s\S]*?```/g
@@ -29,7 +30,7 @@ export const parseMarkdown = (markdown: string): Segment[] => {
   }
   blocks.push(...normalized.slice(cursor).split(/\n{2,}/).filter((part) => part.trim()).map((text) => ({ text: text.trim(), code: false })))
   return blocks.map((block, index) => ({
-    id: `segment-import-${index + 1}`,
+    id: `${prefix}-${index + 1}`,
     index: index + 1,
     kind: segmentKind(block.text, block.code),
     sourceText: block.text,
@@ -37,6 +38,8 @@ export const parseMarkdown = (markdown: string): Segment[] => {
     status: 'draft' as const,
     protectedTokens: extractProtected(block.text),
     note: '',
+    // 首次导入即基线：之后上游更新可做三向合并；不标记时按无基线旧稿兼容处理。
+    ...(options.markBaseline ? { baselineSource: block.text, baselineTarget: '' } : {}),
   }))
 }
 
